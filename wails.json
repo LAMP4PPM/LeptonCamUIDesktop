@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "LeptonCamUIDesktop",
+  "outputfilename": "LeptonCamUIDesktop",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Swetraj",
+    "email": "and90swet@gmail.com"
+  }
+}
