@@ -84,10 +84,6 @@ function pathFor(id: string): string {
           <div class="font-mono text-[9px] tracking-[0.15em] uppercase text-[#5f6e7b]">Current Max</div>
           <div class="font-mono text-lg font-semibold tabular-nums text-[#2dd4bf]">{{ currentMax.toFixed(1) }}°C</div>
         </div>
-        <div class="text-right">
-          <div class="font-mono text-[9px] tracking-[0.15em] uppercase text-[#5f6e7b]">Highest Recorded</div>
-          <div class="font-mono text-lg font-semibold tabular-nums text-[#f59e0b]">{{ highestRecorded.toFixed(1) }}°C</div>
-        </div>
       </div>
     </div>
 
