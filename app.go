@@ -19,6 +19,9 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"go.bug.st/serial"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 )
 
 const (
@@ -26,7 +29,15 @@ const (
 	frameHeight = 60
 	frameSize   = frameWidth * frameHeight * 2 // uint16 per pixel
 	centerIndex = (frameHeight/2)*frameWidth + frameWidth/2
+	imgScale    = 10
 )
+
+var roiColors = []color.RGBA{
+	{0x2d, 0xd4, 0xbf, 255},
+	{0xf5, 0x9e, 0x0b, 255},
+	{0xa7, 0x8b, 0xfa, 255},
+	{0x38, 0xbd, 0xf8, 255},
+}
 
 // ThermalFrame is the payload emitted on "device:frame". It mirrors the
 // DeviceFrame interface consumed by useDeviceState on the Vue side.
@@ -76,7 +87,7 @@ type App struct {
 
 	streaming   bool
 	recording   bool
-	captureRate int // milliseconds between recorded samples
+	captureRate int // seconds between recorded samples
 
 	regions []Region
 
@@ -88,20 +99,17 @@ type App struct {
 	csvWriter    *csv.Writer
 	recRegions   []Region // column set, frozen at record start
 	lastRecWrite time.Time
+	recStart     time.Time
 
 	portWatchStop chan struct{}
 }
 
 func NewApp() *App {
 	return &App{
-		captureRate: 100,
-		// Seed the defaults the Vue composable also starts with, so CSV columns
+		captureRate: 10,
 		// exist even before the user adds ROIs via "Define New" or by
 		// clicking/dragging on the live feed.
-		regions: []Region{
-			{ID: "ROI_01", X: 0.31, Y: 0.42},
-			{ID: "ROI_02", X: 0.66, Y: 0.55},
-		},
+		regions: nil,
 	}
 }
 
@@ -282,12 +290,13 @@ func (a *App) StartRecording() (string, error) {
 	a.csvWriter = csv.NewWriter(csvFile)
 	a.recRegions = append([]Region(nil), a.regions...) // freeze columns
 	a.lastRecWrite = time.Time{}
+	a.recStart = time.Now()
 	a.recording = true
 
 	// Header: time + image filename + frame stats + one column per ROI. Area
 	// ROIs (W/H > 0) get an "_avg" suffix so a CSV reader can tell a box
 	// average from a single-pixel point sample at a glance.
-	header := []string{"timestamp_ms", "image_file", "min_c", "max_c", "center_c"}
+	header := []string{"datetime", "elapsed_s", "image_file", "min_c", "max_c", "center_c"}
 	for _, r := range a.recRegions {
 		col := r.ID
 		if r.W > 0 || r.H > 0 {
@@ -339,13 +348,63 @@ func (a *App) SetCaptureRate(ms int) error {
 	return nil
 }
 
-// DefineRegion adds a new ROI. w/h are normalized box dimensions; pass 0/0
-// for a single-pixel point ROI, or non-zero to make this an area ROI whose
-// recorded value is the box average (see sampleRegion).
 func (a *App) DefineRegion(id string, x, y, w, h float64) error {
 	a.mu.Lock()
-	a.regions = append(a.regions, Region{ID: id, X: x, Y: y, W: w, H: h})
-	a.mu.Unlock()
+	defer a.mu.Unlock()
+	r := Region{ID: id, X: x, Y: y, W: w, H: h}
+	a.regions = append(a.regions, r)
+	if a.recording {
+		return a.addRecordedRegionLocked(r)
+	}
+	return nil
+}
+
+// addRecordedRegionLocked appends a column for r to the live CSV. Must hold a.mu.
+func (a *App) addRecordedRegionLocked(r Region) error {
+	if a.csvFile == nil || a.csvWriter == nil {
+		return nil
+	}
+	for _, e := range a.recRegions {
+		if e.ID == r.ID { // duplicate ID would create an ambiguous column
+			return nil
+		}
+	}
+
+	path := a.csvFile.Name()
+	a.csvWriter.Flush()
+	a.csvFile.Close()
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	rows, err := csv.NewReader(f).ReadAll()
+	f.Close()
+	if err != nil {
+		return err
+	}
+
+	col := r.ID
+	if r.W > 0 || r.H > 0 {
+		col += "_avg"
+	}
+	for i := range rows {
+		if i == 0 {
+			rows[i] = append(rows[i], col)
+		} else {
+			rows[i] = append(rows[i], "") // not tracked yet at this time
+		}
+	}
+
+	out, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	cw := csv.NewWriter(out)
+	_ = cw.WriteAll(rows) // WriteAll flushes
+	a.csvFile = out
+	a.csvWriter = cw
+	a.recRegions = append(a.recRegions, r)
 	return nil
 }
 
@@ -442,7 +501,7 @@ func (a *App) readLoop(port serial.Port, stopCh chan struct{}) {
 			if a.framesDir != "" {
 				a.frameSeq++
 				name := fmt.Sprintf("frame_%06d.png", a.frameSeq)
-				if err := writeFramePNG(filepath.Join(a.framesDir, name), temps, minT, maxT); err != nil {
+				if err := writeFramePNG(filepath.Join(a.framesDir, name), temps, minT, maxT, a.recRegions); err != nil {
 					runtime.LogErrorf(a.ctx, "frame png write failed: %v", err)
 				} else {
 					imgRel = filepath.ToSlash(filepath.Join("frames", name))
@@ -451,7 +510,8 @@ func (a *App) readLoop(port serial.Port, stopCh chan struct{}) {
 			if a.csvWriter != nil {
 				row := make([]string, 0, 5+len(a.recRegions))
 				row = append(row,
-					strconv.FormatInt(now.UnixMilli(), 10),
+					now.Format("2006/01/02 15:04:05"),
+					strconv.FormatFloat(now.Sub(a.recStart).Seconds(), 'f', 3, 64),
 					imgRel,
 					f2(minT), f2(maxT), f2(temps[centerIndex]),
 				)
@@ -526,25 +586,106 @@ func heat(norm float64) color.RGBA {
 // writeFramePNG renders an 80x60 thermal frame to a PNG, colorized with the
 // inferno map normalized to this frame's own min/max. Absolute temperatures
 // are preserved in the CSV, so the image is purely for visual review.
-func writeFramePNG(path string, temps []float64, minT, maxT float64) error {
-	img := image.NewRGBA(image.Rect(0, 0, frameWidth, frameHeight))
+func writeFramePNG(path string, temps []float64, minT, maxT float64, regions []Region) error {
+	img := image.NewRGBA(image.Rect(0, 0, frameWidth*imgScale, frameHeight*imgScale))
 	span := maxT - minT
+
+	// 1. nearest-neighbour upscale: fill an imgScale x imgScale block per pixel
 	for y := 0; y < frameHeight; y++ {
 		for x := 0; x < frameWidth; x++ {
-			t := temps[y*frameWidth+x]
 			norm := 0.0
 			if span > 0 {
-				norm = (t - minT) / span
+				norm = (temps[y*frameWidth+x] - minT) / span
 			}
-			img.Set(x, y, heat(norm))
+			c := heat(norm)
+			for dy := 0; dy < imgScale; dy++ {
+				for dx := 0; dx < imgScale; dx++ {
+					img.SetRGBA(x*imgScale+dx, y*imgScale+dy, c)
+				}
+			}
 		}
 	}
+
+	// 2. ROI overlay: outline + "ID temp" label
+	for i, r := range regions {
+		x0, y0, x1, y1 := regionBounds(r)
+		c := roiColors[i%len(roiColors)]
+		drawText(img, r.ID, x0*imgScale, y0*imgScale-14, c)
+		drawRect(img,
+			x0*imgScale, y0*imgScale,
+			(x1+1)*imgScale-1, (y1+1)*imgScale-1,
+			c)
+		drawText(img, fmt.Sprintf("%.1fC", sampleRegion(temps, r)), x0*imgScale, (y1+1)*imgScale+1, c)
+	}
+
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	return png.Encode(f, img)
+}
+
+// drawText draws text with no background box. A 1px black outline keeps it
+// readable on any heat color; delete the shadow loop if you want plain text.
+func drawText(img *image.RGBA, text string, x, y int, c color.RGBA) {
+	w := len(text) * 7 // basicfont.Face7x13 is 7 px per character
+	b := img.Bounds()
+	if x+w > b.Max.X {
+		x = b.Max.X - w
+	}
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	if y+13 > b.Max.Y {
+		y = b.Max.Y - 13
+	}
+	baseline := y + 11
+
+	black := image.NewUniform(color.RGBA{0, 0, 0, 255})
+	for _, o := range [][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+		d := &font.Drawer{Dst: img, Src: black, Face: basicfont.Face7x13,
+			Dot: fixed.P(x+o[0], baseline+o[1])}
+		d.DrawString(text)
+	}
+	d := &font.Drawer{Dst: img, Src: image.NewUniform(c), Face: basicfont.Face7x13,
+		Dot: fixed.P(x, baseline)}
+	d.DrawString(text)
+}
+
+// regionBounds returns the inclusive pixel box a ROI covers (a point ROI
+// returns a 1x1 box). Same math as sampleRegion.
+func regionBounds(r Region) (x0, y0, x1, y1 int) {
+	if r.W <= 0 && r.H <= 0 {
+		px := clampInt(int(math.Round(r.X*float64(frameWidth-1))), 0, frameWidth-1)
+		py := clampInt(int(math.Round(r.Y*float64(frameHeight-1))), 0, frameHeight-1)
+		return px, py, px, py
+	}
+	x0 = clampInt(int(math.Round((r.X-r.W/2)*float64(frameWidth-1))), 0, frameWidth-1)
+	x1 = clampInt(int(math.Round((r.X+r.W/2)*float64(frameWidth-1))), 0, frameWidth-1)
+	y0 = clampInt(int(math.Round((r.Y-r.H/2)*float64(frameHeight-1))), 0, frameHeight-1)
+	y1 = clampInt(int(math.Round((r.Y+r.H/2)*float64(frameHeight-1))), 0, frameHeight-1)
+	if x1 < x0 {
+		x0, x1 = x1, x0
+	}
+	if y1 < y0 {
+		y0, y1 = y1, y0
+	}
+	return
+}
+
+func drawRect(img *image.RGBA, x0, y0, x1, y1 int, c color.RGBA) {
+	for x := x0; x <= x1; x++ {
+		img.SetRGBA(x, y0, c)
+		img.SetRGBA(x, y1, c)
+	}
+	for y := y0; y <= y1; y++ {
+		img.SetRGBA(x0, y, c)
+		img.SetRGBA(x1, y, c)
+	}
 }
 
 /* -------------------------------------------------------------------------- */

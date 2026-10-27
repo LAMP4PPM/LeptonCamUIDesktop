@@ -1,10 +1,11 @@
 module LeptonCamUIDesktop
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/wailsapp/wails/v2 v2.12.0
 	go.bug.st/serial v1.7.1
+	golang.org/x/image v0.12.0
 )
 
 require (
@@ -34,8 +35,8 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
 
 // replace github.com/wailsapp/wails/v2 v2.12.0 => C:\Users\swet\go\pkg\mod
